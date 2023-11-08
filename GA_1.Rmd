@@ -1,0 +1,1485 @@
+---
+title: "GA_1"
+author: "moonyejoon"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Library Load
+```{r}
+if (!require("knitr")) {
+  install.packages("knitr")
+}
+library(knitr)
+
+if (!require("lattice")) {
+  install.packages("lattice")
+}
+library(lattice)
+
+if (!require("zoo")) {
+  install.packages("zoo")
+}
+library(zoo)
+
+# quantmod 패키지
+if (!require("quantmod")) {
+  install.packages("quantmod")
+}
+library(quantmod)
+
+# dplyr 패키지
+if (!require("dplyr")) {
+  install.packages("dplyr")
+}
+library(dplyr)
+
+# lubridate 패키지
+if (!require("lubridate")) {
+  install.packages("lubridate")
+}
+library(lubridate)
+
+# ggplot2 패키지
+if (!require("ggplot2")) {
+  install.packages("ggplot2")
+}
+library(ggplot2)
+
+# FinCal 패키지
+if (!require("FinCal")) {
+  install.packages("FinCal")
+}
+library(FinCal)
+
+if (!require("stringr")) {
+  install.packages("stringr")
+}
+library(stringr)
+
+if (!require("tidyverse")) {
+  install.packages("tidyverse")
+}
+library(tidyverse)
+
+if (!require("ggpubr")) {
+  install.packages("ggpubr")
+}
+library(ggpubr)
+
+```
+
+
+# 2. functions
+## 2.1 get_close_prices 주가 가져오기
+```{r}
+get_close_prices <- function(ticker, start_date, end_date) {
+  # 시기 시작일과 종료일을 Date 형식으로 변환
+  original_start_date <- as.Date(start_date)
+  start_date <- original_start_date - months(1)
+  end_date <- as.Date(end_date)
+
+  # 주식 데이터 가져오기
+  getSymbols(ticker, src = "yahoo", from = start_date, to = end_date)
+
+   # 종가(close price) 추출 및 열 이름 변경
+   close_prices <- Cl(get(ticker))
+   colnames(close_prices) <- "Close"
+
+   # 날짜와 종가로 구성된 데이터프레임 생성
+   df <- data.frame(Date = index(close_prices), Close = coredata(close_prices))
+
+   #mean and sd calculations without adding to dataframe.
+    df$Mean = rollapply(df$Close,width=20,FUN=mean,
+                              align="right", fill=NA)
+    df$Sd=rollapply(df$Close,width=20,FUN=sd,
+                              align="right", fill=NA)
+
+    #Adding U_BB and D_BB columns based on the calculated mean and standard deviation.
+    df$U_BB<- df$Mean + df$Sd*0.5
+    df$D_BB<- df$Mean - df$Sd*0.5
+
+
+  return(df[df$Date >= original_start_date, ])
+}
+
+```
+
+## 2.2 BB로 매수 타이밍 갖기  get_labels_rows
+```{r}
+get_labels_rows <- function(df) {
+  df$Date <- as.Date(df$Date)
+
+  # Add a new column 'Label'
+  df <- df %>%
+    mutate(Label = ifelse(Close > U_BB, 1,
+                          ifelse(Close < D_BB, -1,
+                                 0)),
+           YearMonth = paste(year(Date), str_pad(month(Date), 2, pad = "0"), sep=""))
+
+   # Group by YearMonth and filter the earliest row where Label is either -1 or 1
+   label_rows <- df %>%
+     group_by(YearMonth) %>%
+     filter(Label == 1 |Label == -1 ) %>%
+     slice(which.min(Date))
+
+   # For each YearMonth group where there are no rows with Label of either -1 or -1,
+   # select the row with the max date of that month
+   last_day_rows <- df %>%
+     group_by(YearMonth) %>%
+     slice(which.max(Date))
+
+   # Check which YearMonths are missing in label_rows and keep only those in last_day_rows
+   missing_ym <- setdiff(unique(last_day_rows$YearMonth), unique(label_rows$YearMonth))
+
+   last_day_rows <- last_day_rows %>%
+                     filter(YearMonth %in% missing_ym)
+
+ result_df = rbind(label_rows,last_day_rows)
+
+ return(arrange(result_df, Date))
+}
+```
+
+## 2.3 말 일 거래 get_last_day_rows
+```{r}
+# DF 데이터프레임에서 월별로 가장 늦은 날짜에 해당하는 행들을 추출하는 함수
+get_last_day_rows <- function(df) {
+  df$Date <- as.Date(df$Date)
+  last_day_rows <- df %>%
+    group_by(Year = year(Date), Month = month(Date)) %>%
+    filter(Date == max(Date)) %>%
+    ungroup() %>%  # ungroup after grouping operation
+    select(-Year, -Month)  # remove Year and Month columns
+
+  return(last_day_rows)
+}
+```
+
+## 2.4 VA add_VA
+```{r}
+add_VA <- function(df) {
+df$VA_Value_Required <- seq(from = 100, by = 100, length.out = nrow(df))
+df$VA_Shares_Owned <- df$VA_Value_Required/df$Close
+df$VA_Shares_Bought<-0
+df$VA_Period_Invest <- NA
+df$VA_Average_cost <- NA
+df$VA_Invest_total <- NA
+df$VA_ROI <- NA
+df$VA_IRR <- NA
+for (i in seq_len(nrow(df))){
+  if(i==1){df$VA_Shares_Bought[i]=df$VA_Shares_Owned[i]}
+  else{
+    df$VA_Shares_Bought[i] <- df$VA_Shares_Owned[i]-df$VA_Shares_Owned[i-1]
+  }
+  df$VA_Period_Invest[i] <- df$VA_Shares_Bought[i] * df$Close[i]
+  df$VA_Average_cost[i] <- mean(df$VA_Period_Invest[1:i])
+  df$VA_Invest_total[i] <- sum(df$VA_Period_Invest[1:i])
+  df$VA_ROI[i] <- (df$VA_Value_Required[i]-df$VA_Invest_total[i])/df$VA_Invest_total[i] *100
+  df$VA_IRR[i] <- calculate_irr(c(-df$VA_Period_Invest[1:i-1], (df$VA_Value_Required[i] - df$VA_Period_Invest[i])))
+}
+
+return(df)
+}
+```
+
+## 2.5 DA add_DA
+```{r}
+add_DA <- function(df) {
+  df$DA_Period_Invest <- 100
+  df$DA_Shares_Bought <- df$DA_Period_Invest/df$Close
+  df$DA_Shares_Owned <- cumsum(df$DA_Shares_Bought)
+  df$DA_Period_Invest <- as.numeric(df$DA_Period_Invest)
+  df$DA_Value <- df$Close * df$DA_Shares_Owned
+  # 초기화
+  df$DA_Average_cost <- NA
+  df$DA_Invest_total <- NA
+  df$DA_IRR<-NA
+  df$DA_ROI<-NA
+  for(i in seq_len(nrow(df))) {
+    df$DA_Average_cost[i] <- mean(df$DA_Period_Invest[1:i])
+    df$DA_Invest_total[i] <- sum(df$DA_Period_Invest[1:i])
+    df$DA_ROI[i] <- (df$DA_Value[i]-df$DA_Invest_total[i])/df$DA_Invest_total[i] *100
+    df$DA_IRR[i] <- calculate_irr(c(-df$DA_Period_Invest[1:i-1], (df$DA_Value[i] - df$DA_Period_Invest[i])))
+  }
+  df$DA_Value <- df$Close * df$DA_Shares_Owned
+  return(df)
+
+}
+```
+
+## 2.6 GA add_GA
+```{r}
+add_GA <- function(df) {
+df$GA_Shares_Bought<- NA
+df$GA_Shares_Owned<- NA
+df$GA_Period_Invest <- NA
+df$GA_Value <- NA
+df$GA_Average_cost <- NA
+df$GA_Invest_total <- NA
+df$Gap<-0
+df$GA_ROI<-NA
+df$GA_IRR<-NA
+
+for (i in seq_len(nrow(df))){
+  if (i>=2){
+    df$Gap[i] = (df$Close[i]-df$Mean[i])/df$Sd[i]
+    }
+}
+
+# 표준 정규 분포의 PDF 계산 및 Gause 열 생성
+df$Gause <- dnorm(df$Gap, mean = 0, sd = 1)
+
+for (i in seq_len(nrow(df))){
+  df$GA_Shares_Bought[i] <- df$VA_Shares_Bought[i]*df$Gause[i]+df$DA_Shares_Bought[i]*(1-df$Gause[i])
+  df$GA_Period_Invest[i] <- df$GA_Shares_Bought[i] * df$Close[i]
+  df$GA_Average_cost[i] <- mean(df$GA_Period_Invest[1:i])
+  df$GA_Invest_total[i] <- sum(df$GA_Period_Invest[1:i])
+  if(i==1){df$GA_Shares_Owned[i]=df$GA_Shares_Bought[i]}
+  else{
+    df$GA_Shares_Owned[i] <- df$GA_Shares_Bought[i]+df$GA_Shares_Owned[i-1]
+  }
+  df$GA_Value[i] <-df$GA_Shares_Owned[i] * df$Close[i]
+  df$GA_ROI[i] <- (df$GA_Value[i]-df$GA_Invest_total[i])/df$GA_Invest_total[i] *100
+  df$GA_IRR[i] <- calculate_irr(c(-df$GA_Period_Invest[1:i-1], (df$GA_Value[i] - df$GA_Period_Invest[i])))
+}
+return(df)
+}
+```
+
+```{r}
+# Set parameters
+mu <- 0
+sigma <- 0.8
+
+# Generate sequence of x values
+x <- seq(-3*sigma + mu, 3*sigma + mu, length.out = 100)
+
+# Calculate corresponding y values (probability density)
+y <- dnorm(x, mean = mu, sd = sigma)
+
+# Open a new graphics window with square dimensions
+par(pin=c(4,4))
+
+# Create plot
+plot(x, y, type="l", lwd=2,
+     main="Normal Distribution",
+     xlab="Value", ylab="Density",
+     xlim=c(-3*sigma + mu, 3*sigma + mu), ylim=c(0,max(y)))
+
+```
+
+
+
+## 2.7 irr calculate_irr
+
+```{r}
+calculate_irr <- function(cash_flows) {
+  tryCatch({
+    irr_value <- irr(cash_flows) * 100
+    return(irr_value)
+  }, error = function(e) {
+    return(NA) # If an error occurs, return NA
+  })
+}
+```
+```{r}
+QQQ$VA_IRR[dim(QQQ)[1]]
+```
+
+
+## 2.8 calculate_metrics 3년 주기
+```{r}
+rate <-0.292
+calculate_metrics_3y <- function(lst){
+  result_df <- data.frame() # 결과를 저장할 빈 데이터프레임 생성
+
+  for(tiker in tikers){
+    df <- get_close_prices(tiker,"2000-01-01","2023-09-01")
+    df_last <- get_last_day_rows(df)
+    df_label <- get_labels_rows(df)
+
+       # 시작 년도와 마지막 년도 추출
+    start_year <- year(min(df$Date))
+    end_year <- year(max(df$Date))
+
+    for (start in start_year:(end_year-2)) {
+      end <- start + 3
+
+      # 해당 기간 동안의 데이터만 선택하여 복사본 생성
+      df_period1 <- df_last %>% filter(Date >= as.Date(paste0(start, "-01-01")) &
+                                  Date < as.Date(paste0(end, "-01-01")))
+      df_period2 <- df_label %>% filter(Date >= as.Date(paste0(start, "-01-01")) &
+                                  Date < as.Date(paste0(end, "-01-01")))
+
+      if(nrow(df_period1) > 0 && nrow(df_period2) > 0){
+        df_period1<-add_VA(df_period1)
+        df_period2<-add_VA(df_period2)
+        df_period1<-add_DA(df_period1)
+        df_period2<-add_DA(df_period2)
+        df_period1<-add_GA(df_period1)
+        df_period2<-add_GA(df_period2)
+        
+        Last_GA_ROI <- df_period1$GA_ROI[dim(df_period1)[1]]
+        Label_GA_ROI <- df_period2$GA_ROI[dim(df_period2)[1]]
+        
+        Last_VA_IRR <- df_period1$VA_IRR[dim(df_period1)[1]]
+        Label_VA_IRR <- df_period2$VA_IRR[dim(df_period2)[1]]
+
+        Last_DA_IRR <- df_period1$DA_IRR[dim(df_period1)[1]]
+        Label_DA_IRR <- df_period2$DA_IRR[dim(df_period2)[1]]
+  
+        Last_GA_IRR <- df_period1$GA_IRR[dim(df_period1)[1]]
+        Label_GA_IRR <- df_period2$GA_IRR[dim(df_period2)[1]]
+        
+        Last_VA_volatility <- sd(df_period1$VA_IRR,na.rm = TRUE)*sqrt(252)
+        Label_VA_volatility <- sd(df_period2$VA_IRR,na.rm = TRUE)*sqrt(252)
+        
+        Last_DA_volatility <- sd(df_period1$DA_IRR,na.rm = TRUE)*sqrt(252)
+        Label_DA_volatility <- sd(df_period2$DA_IRR,na.rm = TRUE)*sqrt(252)
+        
+        Last_GA_volatility <- sd(df_period1$GA_IRR,na.rm = TRUE)*sqrt(252)
+        Label_GA_volatility <- sd(df_period2$GA_IRR,na.rm = TRUE)*sqrt(252)
+        
+        Last_VA_Sharpe_Ratio<- (mean(df_period1$VA_IRR,na.rm = TRUE)-rate)/sd(df_period1$VA_IRR,na.rm = TRUE)
+        Label_VA_Sharpe_Ratio<- (mean(df_period2$VA_IRR,na.rm = TRUE)-rate)/sd(df_period2$VA_IRR,na.rm = TRUE)
+        Last_DA_Sharpe_Ratio<- (mean(df_period1$DA_IRR,na.rm = TRUE)-rate)/sd(df_period1$DA_IRR,na.rm = TRUE)
+        Label_DA_Sharpe_Ratio<- (mean(df_period2$DA_IRR,na.rm = TRUE)-rate)/sd(df_period2$DA_IRR,na.rm = TRUE)  
+        Last_GA_Sharpe_Ratio<- (mean(df_period1$GA_IRR,na.rm = TRUE)-rate)/sd(df_period1$GA_IRR,na.rm = TRUE)
+        Label_GA_Sharpe_Ratio<- (mean(df_period2$GA_IRR,na.rm = TRUE)-rate)/sd(df_period2$GA_IRR,na.rm = TRUE)
+        
+        Last_VA_MDD <-(max(df_period1$VA_IRR,na.rm = TRUE)-min(df_period1$VA_IRR,na.rm = TRUE))/max(df_period1$VA_IRR,na.rm = TRUE)
+        Label_VA_MDD <-(max(df_period2$VA_IRR,na.rm = TRUE)-min(df_period2$VA_IRR,na.rm = TRUE))/max(df_period2$VA_IRR,na.rm = TRUE)
+        
+        Last_DA_MDD <-(max(df_period1$DA_IRR,na.rm = TRUE)-min(df_period1$DA_IRR,na.rm = TRUE))/max(df_period1$DA_IRR,na.rm = TRUE)
+        Label_DA_MDD <-(max(df_period2$DA_IRR,na.rm = TRUE)-min(df_period2$DA_IRR,na.rm = TRUE))/max(df_period2$DA_IRR,na.rm = TRUE)
+        
+        Last_GA_MDD <-(max(df_period1$GA_IRR,na.rm = TRUE)-min(df_period1$GA_IRR,na.rm = TRUE))/max(df_period1$GA_IRR,na.rm = TRUE)
+        Label_GA_MDD <-(max(df_period2$GA_IRR,na.rm = TRUE)-min(df_period2$GA_IRR,na.rm = TRUE))/max(df_period2$GA_IRR,na.rm = TRUE)
+        
+        
+        new_row = data.frame(
+          Ticker = tiker,
+          Year_Start = start,
+          Last_GA_ROI = Last_GA_ROI,
+          Label_GA_ROI = Label_GA_ROI,
+          Last_VA_IRR = Last_VA_IRR,
+          Label_VA_IRR = Label_VA_IRR,
+          Last_DA_IRR = Last_DA_IRR,
+          Label_DA_IRR = Label_DA_IRR,
+          Last_GA_IRR = Last_GA_IRR,
+          Label_GA_IRR = Label_GA_IRR,
+          Last_VA_Sharpe_Ratio = Last_VA_Sharpe_Ratio,
+          Label_VA_Sharpe_Ratio = Label_VA_Sharpe_Ratio,
+          Last_DA_Sharpe_Ratio = Last_DA_Sharpe_Ratio,
+          Label_DA_Sharpe_Ratio = Label_DA_Sharpe_Ratio,
+          Last_GA_Sharpe_Ratio = Last_GA_Sharpe_Ratio,
+          Label_GA_Sharpe_Ratio = Label_GA_Sharpe_Ratio,          
+          Last_VA_volatility = Last_VA_volatility,
+          Label_VA_volatility = Label_VA_volatility,
+          Last_DA_volatility = Last_DA_volatility,
+          Label_DA_volatility = Label_DA_volatility,
+          Last_GA_volatility = Last_GA_volatility,
+          Label_GA_volatility = Label_GA_volatility,
+          Last_VA_MDD = Last_VA_MDD,
+          Label_VA_MDD = Label_VA_MDD,
+          Last_DA_MDD = Last_DA_MDD,
+          Label_DA_MDD = Label_DA_MDD,
+          Last_GA_MDD = Last_GA_MDD,
+          Label_GA_MDD = Label_GA_MDD
+         )
+
+       # 결과 데이터프레임에 추가
+       result_df=rbind(result_df,new_row)
+     }
+   }
+  }
+negative_counts <- apply(result_df[,3:8], 2, function(x) sum(x < 0, na.rm = TRUE)/dim(result_df)[1]*100)
+print(negative_counts)
+return(result_df)
+}
+```
+
+
+```{r}
+tikers=c("SPY", "QQQ", "DIA")
+df_3y=calculate_metrics_3y(tikers)
+```
+```{r}
+df_3y
+write.csv(df_3y,"3y.csv")
+shapiro.test(df_3y$Last_GA_IRR)
+shapiro.test(df_3y$Last_DA_IRR)
+```
+```{r}
+wilcox.test(df_3y$Last_DA_IRR, df_3y$Last_GA_IRR, paired = TRUE, alternative = "less")
+mean(df_3y$Last_GA_IRR)
+mean(df_3y$Last_DA_IRR)
+
+```
+```{r}
+wilcox.test(df_3y$Last_DA_Sharpe_Ratio, df_3y$Last_GA_Sharpe_Ratio, paired = TRUE, alternative = "less")
+```
+
+```{r}
+wilcox.test(df_3y$Last_GA_IRR, df_3y$Label_GA_IRR, paired = TRUE, alternative = "less")
+```
+
+
+## 2.9 calculate_metrics 5년 주기
+
+```{r}
+calculate_metrics_5y <- function(lst){
+  result_df <- data.frame() # 결과를 저장할 빈 데이터프레임 생성
+
+  for(tiker in tikers){
+    df <- get_close_prices(tiker,"1990-01-01","2023-09-01")
+    df_last <- get_last_day_rows(df)
+    df_label <- get_labels_rows(df)
+
+       # 시작 년도와 마지막 년도 추출
+    start_year <- year(min(df$Date))
+    end_year <- year(max(df$Date))
+
+    for (start in start_year:(end_year-4)) {
+      end <- start + 5
+
+      # 해당 기간 동안의 데이터만 선택하여 복사본 생성
+      df_period1 <- df_last %>% filter(Date >= as.Date(paste0(start, "-01-01")) &
+                                  Date < as.Date(paste0(end, "-01-01")))
+      df_period2 <- df_label %>% filter(Date >= as.Date(paste0(start, "-01-01")) &
+                                  Date < as.Date(paste0(end, "-01-01")))
+
+      if(nrow(df_period1) > 0 && nrow(df_period2) > 0){
+        df_period1<-add_VA(df_period1)
+        df_period2<-add_VA(df_period2)
+        df_period1<-add_DA(df_period1)
+        df_period2<-add_DA(df_period2)
+        df_period1<-add_GA(df_period1)
+        df_period2<-add_GA(df_period2)
+        
+        Last_GA_ROI <- df_period1$GA_ROI[dim(df_period1)[1]]
+        Label_GA_ROI <- df_period2$GA_ROI[dim(df_period2)[1]]
+        
+        Last_VA_IRR <- df_period1$VA_IRR[dim(df_period1)[1]]
+        Label_VA_IRR <- df_period2$VA_IRR[dim(df_period2)[1]]
+
+        Last_DA_IRR <- df_period1$DA_IRR[dim(df_period1)[1]]
+        Label_DA_IRR <- df_period2$DA_IRR[dim(df_period2)[1]]
+  
+        Last_GA_IRR <- df_period1$GA_IRR[dim(df_period1)[1]]
+        Label_GA_IRR <- df_period2$GA_IRR[dim(df_period2)[1]]
+        
+        Last_VA_volatility <- sd(df_period1$VA_IRR,na.rm = TRUE)*sqrt(252)
+        Label_VA_volatility <- sd(df_period2$VA_IRR,na.rm = TRUE)*sqrt(252)
+        
+        Last_DA_volatility <- sd(df_period1$DA_IRR,na.rm = TRUE)*sqrt(252)
+        Label_DA_volatility <- sd(df_period2$DA_IRR,na.rm = TRUE)*sqrt(252)
+        
+        Last_GA_volatility <- sd(df_period1$GA_IRR,na.rm = TRUE)*sqrt(252)
+        Label_GA_volatility <- sd(df_period2$GA_IRR,na.rm = TRUE)*sqrt(252)
+        
+        Last_VA_Sharpe_Ratio<- (mean(df_period1$VA_IRR,na.rm = TRUE)-rate)/sd(df_period1$VA_IRR,na.rm = TRUE)
+        Label_VA_Sharpe_Ratio<- (mean(df_period2$VA_IRR,na.rm = TRUE)-rate)/sd(df_period2$VA_IRR,na.rm = TRUE)
+        Last_DA_Sharpe_Ratio<- (mean(df_period1$DA_IRR,na.rm = TRUE)-rate)/sd(df_period1$DA_IRR,na.rm = TRUE)
+        Label_DA_Sharpe_Ratio<- (mean(df_period2$DA_IRR,na.rm = TRUE)-rate)/sd(df_period2$DA_IRR,na.rm = TRUE)  
+        Last_GA_Sharpe_Ratio<- (mean(df_period1$GA_IRR,na.rm = TRUE)-rate)/sd(df_period1$GA_IRR,na.rm = TRUE)
+        Label_GA_Sharpe_Ratio<- (mean(df_period2$GA_IRR,na.rm = TRUE)-rate)/sd(df_period2$GA_IRR,na.rm = TRUE)
+        
+        Last_VA_MDD <-(max(df_period1$VA_IRR,na.rm = TRUE)-min(df_period1$VA_IRR,na.rm = TRUE))/max(df_period1$VA_IRR,na.rm = TRUE)
+        Label_VA_MDD <-(max(df_period2$VA_IRR,na.rm = TRUE)-min(df_period2$VA_IRR,na.rm = TRUE))/max(df_period2$VA_IRR,na.rm = TRUE)
+        
+        Last_DA_MDD <-(max(df_period1$DA_IRR,na.rm = TRUE)-min(df_period1$DA_IRR,na.rm = TRUE))/max(df_period1$DA_IRR,na.rm = TRUE)
+        Label_DA_MDD <-(max(df_period2$DA_IRR,na.rm = TRUE)-min(df_period2$DA_IRR,na.rm = TRUE))/max(df_period2$DA_IRR,na.rm = TRUE)
+        
+        Last_GA_MDD <-(max(df_period1$GA_IRR,na.rm = TRUE)-min(df_period1$GA_IRR,na.rm = TRUE))/max(df_period1$GA_IRR,na.rm = TRUE)
+        Label_GA_MDD <-(max(df_period2$GA_IRR,na.rm = TRUE)-min(df_period2$GA_IRR,na.rm = TRUE))/max(df_period2$GA_IRR,na.rm = TRUE)
+        
+        
+        new_row = data.frame(
+          Ticker = tiker,
+          Year_Start = start,
+          Last_GA_ROI = Last_GA_ROI,
+          Label_GA_ROI = Label_GA_ROI,
+          Last_VA_IRR = Last_VA_IRR,
+          Label_VA_IRR = Label_VA_IRR,
+          Last_DA_IRR = Last_DA_IRR,
+          Label_DA_IRR = Label_DA_IRR,
+          Last_GA_IRR = Last_GA_IRR,
+          Label_GA_IRR = Label_GA_IRR,
+          Last_VA_Sharpe_Ratio = Last_VA_Sharpe_Ratio,
+          Label_VA_Sharpe_Ratio = Label_VA_Sharpe_Ratio,
+          Last_DA_Sharpe_Ratio = Last_DA_Sharpe_Ratio,
+          Label_DA_Sharpe_Ratio = Label_DA_Sharpe_Ratio,
+          Last_GA_Sharpe_Ratio = Last_GA_Sharpe_Ratio,
+          Label_GA_Sharpe_Ratio = Label_GA_Sharpe_Ratio,          
+          Last_VA_volatility = Last_VA_volatility,
+          Label_VA_volatility = Label_VA_volatility,
+          Last_DA_volatility = Last_DA_volatility,
+          Label_DA_volatility = Label_DA_volatility,
+          Last_GA_volatility = Last_GA_volatility,
+          Label_GA_volatility = Label_GA_volatility,
+          Last_VA_MDD = Last_VA_MDD,
+          Label_VA_MDD = Label_VA_MDD,
+          Last_DA_MDD = Last_DA_MDD,
+          Label_DA_MDD = Label_DA_MDD,
+          Last_GA_MDD = Last_GA_MDD,
+          Label_GA_MDD = Label_GA_MDD
+         )
+
+       # 결과 데이터프레임에 추가
+       result_df=rbind(result_df,new_row)
+     }
+   }
+  }
+negative_counts <- apply(result_df[,3:8], 2, function(x) sum(x < 0, na.rm = TRUE)/dim(result_df)[1]*100)
+print(negative_counts)
+return(result_df)
+}
+```
+
+```{r}
+tikers=c("SPY", "QQQ", "DIA")
+df_5y=calculate_metrics_5y(tikers)
+```
+```{r}
+wilcox.test(df_5y$Last_GA_IRR, df_5y$Label_GA_IRR, paired = TRUE, alternative = "greater")
+
+wilcox.test(df_5y$Last_GA_IRR, df_5y$Last_DA_IRR, paired = TRUE, alternative = "greater")
+
+wilcox.test(df_5y$Last_DA_Sharpe_Ratio, df_5y$Last_GA_Sharpe_Ratio, paired = TRUE, alternative = "less")
+
+```
+```{r}
+wilcox.test(df_5y$Last_GA_ROI, df_5y$Label_GA_ROI, paired = TRUE, alternative = "greater")
+```
+
+
+## 2.10 calculate_metrics 7년 주기
+```{r}
+calculate_metrics_7y <- function(lst){
+  result_df <- data.frame() # 결과를 저장할 빈 데이터프레임 생성
+
+  for(tiker in tikers){
+    df <- get_close_prices(tiker,"2000-01-01","2023-09-01")
+    df_last <- get_last_day_rows(df)
+    df_label <- get_labels_rows(df)
+
+       # 시작 년도와 마지막 년도 추출
+    start_year <- year(min(df$Date))
+    end_year <- year(max(df$Date))
+
+    for (start in start_year:(end_year-6)) {
+      end <- start + 7
+
+      # 해당 기간 동안의 데이터만 선택하여 복사본 생성
+      df_period1 <- df_last %>% filter(Date >= as.Date(paste0(start, "-01-01")) &
+                                  Date < as.Date(paste0(end, "-01-01")))
+      df_period2 <- df_label %>% filter(Date >= as.Date(paste0(start, "-01-01")) &
+                                  Date < as.Date(paste0(end, "-01-01")))
+
+      if(nrow(df_period1) > 0 && nrow(df_period2) > 0){
+        df_period1<-add_VA(df_period1)
+        df_period2<-add_VA(df_period2)
+        df_period1<-add_DA(df_period1)
+        df_period2<-add_DA(df_period2)
+        df_period1<-add_GA(df_period1)
+        df_period2<-add_GA(df_period2)
+
+        Last_VA_IRR <- df_period1$VA_IRR[dim(df_period1)[1]]
+        Label_VA_IRR <- df_period2$VA_IRR[dim(df_period2)[1]]
+
+        Last_DA_IRR <- df_period1$DA_IRR[dim(df_period1)[1]]
+        Label_DA_IRR <- df_period2$DA_IRR[dim(df_period2)[1]]
+
+        Last_GA_IRR <- df_period1$GA_IRR[dim(df_period1)[1]]
+        Label_GA_IRR <- df_period2$GA_IRR[dim(df_period2)[1]]
+        
+        Last_VA_volatility <- sd(df_period1$VA_IRR,na.rm = TRUE)*sqrt(252)
+        Label_VA_volatility <- sd(df_period2$VA_IRR,na.rm = TRUE)*sqrt(252)
+        
+        Last_DA_volatility <- sd(df_period1$DA_IRR,na.rm = TRUE)*sqrt(252)
+        Label_DA_volatility <- sd(df_period2$DA_IRR,na.rm = TRUE)*sqrt(252)
+        
+        Last_GA_volatility <- sd(df_period1$GA_IRR,na.rm = TRUE)*sqrt(252)
+        Label_GA_volatility <- sd(df_period2$GA_IRR,na.rm = TRUE)*sqrt(252)
+        
+        Last_VA_Sharpe_Ratio<- (mean(df_period1$VA_IRR,na.rm = TRUE)-rate)/sd(df_period1$VA_IRR,na.rm = TRUE)
+        Label_VA_Sharpe_Ratio<- (mean(df_period2$VA_IRR,na.rm = TRUE)-rate)/sd(df_period2$VA_IRR,na.rm = TRUE)
+        Last_DA_Sharpe_Ratio<- (mean(df_period1$DA_IRR,na.rm = TRUE)-rate)/sd(df_period1$DA_IRR,na.rm = TRUE)
+        Label_DA_Sharpe_Ratio<- (mean(df_period2$DA_IRR,na.rm = TRUE)-rate)/sd(df_period2$DA_IRR,na.rm = TRUE)  
+        Last_GA_Sharpe_Ratio<- (mean(df_period1$GA_IRR,na.rm = TRUE)-rate)/sd(df_period1$GA_IRR,na.rm = TRUE)
+        Label_GA_Sharpe_Ratio<- (mean(df_period2$GA_IRR,na.rm = TRUE)-rate)/sd(df_period2$GA_IRR,na.rm = TRUE)
+        
+        Last_VA_MDD <-(max(df_period1$VA_IRR,na.rm = TRUE)-min(df_period1$VA_IRR,na.rm = TRUE))/max(df_period1$VA_IRR,na.rm = TRUE)
+        Label_VA_MDD <-(max(df_period2$VA_IRR,na.rm = TRUE)-min(df_period2$VA_IRR,na.rm = TRUE))/max(df_period2$VA_IRR,na.rm = TRUE)
+        
+        Last_DA_MDD <-(max(df_period1$DA_IRR,na.rm = TRUE)-min(df_period1$DA_IRR,na.rm = TRUE))/max(df_period1$DA_IRR,na.rm = TRUE)
+        Label_DA_MDD <-(max(df_period2$DA_IRR,na.rm = TRUE)-min(df_period2$DA_IRR,na.rm = TRUE))/max(df_period2$DA_IRR,na.rm = TRUE)
+        
+        Last_GA_MDD <-(max(df_period1$GA_IRR,na.rm = TRUE)-min(df_period1$GA_IRR,na.rm = TRUE))/max(df_period1$GA_IRR,na.rm = TRUE)
+        Label_GA_MDD <-(max(df_period2$GA_IRR,na.rm = TRUE)-min(df_period2$GA_IRR,na.rm = TRUE))/max(df_period2$GA_IRR,na.rm = TRUE)
+        
+        
+        new_row = data.frame(
+          Ticker = tiker,
+          Year_Start = start,
+          Last_VA_IRR = Last_VA_IRR,
+          Label_VA_IRR = Label_VA_IRR,
+          Last_DA_IRR = Last_DA_IRR,
+          Label_DA_IRR = Label_DA_IRR,
+          Last_GA_IRR = Last_GA_IRR,
+          Label_GA_IRR = Label_GA_IRR,
+          Last_VA_Sharpe_Ratio = Last_VA_Sharpe_Ratio,
+          Label_VA_Sharpe_Ratio = Label_VA_Sharpe_Ratio,
+          Last_DA_Sharpe_Ratio = Last_DA_Sharpe_Ratio,
+          Label_DA_Sharpe_Ratio = Label_DA_Sharpe_Ratio,
+          Last_GA_Sharpe_Ratio = Last_GA_Sharpe_Ratio,
+          Label_GA_Sharpe_Ratio = Label_GA_Sharpe_Ratio,          
+          Last_VA_volatility = Last_VA_volatility,
+          Label_VA_volatility = Label_VA_volatility,
+          Last_DA_volatility = Last_DA_volatility,
+          Label_DA_volatility = Label_DA_volatility,
+          Last_GA_volatility = Last_GA_volatility,
+          Label_GA_volatility = Label_GA_volatility,
+          Last_VA_MDD = Last_VA_MDD,
+          Label_VA_MDD = Label_VA_MDD,
+          Last_DA_MDD = Last_DA_MDD,
+          Label_DA_MDD = Label_DA_MDD,
+          Last_GA_MDD = Last_GA_MDD,
+          Label_GA_MDD = Label_GA_MDD
+         )
+
+       # 결과 데이터프레임에 추가
+       result_df=rbind(result_df,new_row)
+     }
+   }
+  }
+negative_counts <- apply(result_df[,3:8], 2, function(x) sum(x < 0, na.rm = TRUE)/dim(result_df)[1]*100)
+print(negative_counts)
+return(result_df)
+}
+```
+
+```{r}
+tikers=c("SPY", "QQQ", "DIA")
+df_7=calculate_metrics_7y(tikers)
+```
+```{r}
+wilcox.test(df_7$Last_GA_IRR, df_7$Label_GA_IRR, paired = TRUE, alternative = "greater")
+wilcox.test(df_7$Last_GA_IRR, df_7$Last_DA_IRR, paired = TRUE, alternative = "greater")
+wilcox.test(df_7$Last_DA_Sharpe_Ratio, df_7$Last_GA_Sharpe_Ratio, paired = TRUE, alternative = "less")
+
+```
+
+
+## 2.11 calculate_metrics 10년 주기
+```{r}
+calculate_metrics_10y <- function(lst){
+  result_df <- data.frame() # 결과를 저장할 빈 데이터프레임 생성
+
+  for(tiker in tikers){
+    df <- get_close_prices(tiker,"2000-01-01","2023-09-01")
+    df_last <- get_last_day_rows(df)
+    df_label <- get_labels_rows(df)
+
+       # 시작 년도와 마지막 년도 추출
+    start_year <- year(min(df$Date))
+    end_year <- year(max(df$Date))
+
+    for (start in start_year:(end_year-9)) {
+      end <- start + 10
+
+      # 해당 기간 동안의 데이터만 선택하여 복사본 생성
+      df_period1 <- df_last %>% filter(Date >= as.Date(paste0(start, "-01-01")) &
+                                  Date < as.Date(paste0(end, "-01-01")))
+      df_period2 <- df_label %>% filter(Date >= as.Date(paste0(start, "-01-01")) &
+                                  Date < as.Date(paste0(end, "-01-01")))
+
+      if(nrow(df_period1) > 0 && nrow(df_period2) > 0){
+        df_period1<-add_VA(df_period1)
+        df_period2<-add_VA(df_period2)
+        df_period1<-add_DA(df_period1)
+        df_period2<-add_DA(df_period2)
+        df_period1<-add_GA(df_period1)
+        df_period2<-add_GA(df_period2)
+
+        Last_VA_IRR <- df_period1$VA_IRR[dim(df_period1)[1]]
+        Label_VA_IRR <- df_period2$VA_IRR[dim(df_period2)[1]]
+
+        Last_DA_IRR <- df_period1$DA_IRR[dim(df_period1)[1]]
+        Label_DA_IRR <- df_period2$DA_IRR[dim(df_period2)[1]]
+
+        Last_GA_IRR <- df_period1$GA_IRR[dim(df_period1)[1]]
+        Label_GA_IRR <- df_period2$GA_IRR[dim(df_period2)[1]]
+        
+        Last_VA_volatility <- sd(df_period1$VA_IRR,na.rm = TRUE)*sqrt(252)
+        Label_VA_volatility <- sd(df_period2$VA_IRR,na.rm = TRUE)*sqrt(252)
+        
+        Last_DA_volatility <- sd(df_period1$DA_IRR,na.rm = TRUE)*sqrt(252)
+        Label_DA_volatility <- sd(df_period2$DA_IRR,na.rm = TRUE)*sqrt(252)
+        
+        Last_GA_volatility <- sd(df_period1$GA_IRR,na.rm = TRUE)*sqrt(252)
+        Label_GA_volatility <- sd(df_period2$GA_IRR,na.rm = TRUE)*sqrt(252)
+        
+        
+        Last_VA_Sharpe_Ratio<- (mean(df_period1$VA_IRR,na.rm = TRUE)-0.417)/sd(df_period1$VA_IRR,na.rm = TRUE)
+        Label_VA_Sharpe_Ratio<- (mean(df_period2$VA_IRR,na.rm = TRUE)-0.417)/sd(df_period2$VA_IRR,na.rm = TRUE)
+        Last_DA_Sharpe_Ratio<- (mean(df_period1$DA_IRR,na.rm = TRUE)-0.417)/sd(df_period1$DA_IRR,na.rm = TRUE)
+        Label_DA_Sharpe_Ratio<- (mean(df_period2$DA_IRR,na.rm = TRUE)-0.417)/sd(df_period2$DA_IRR,na.rm = TRUE)  
+        Last_GA_Sharpe_Ratio<- (mean(df_period1$GA_IRR,na.rm = TRUE)-0.417)/sd(df_period1$GA_IRR,na.rm = TRUE)
+        Label_GA_Sharpe_Ratio<- (mean(df_period2$GA_IRR,na.rm = TRUE)-0.417)/sd(df_period2$GA_IRR,na.rm = TRUE)
+        
+        Last_VA_MDD <-(max(df_period1$VA_IRR,na.rm = TRUE)-min(df_period1$VA_IRR,na.rm = TRUE))/max(df_period1$VA_IRR,na.rm = TRUE)
+        Label_VA_MDD <-(max(df_period2$VA_IRR,na.rm = TRUE)-min(df_period2$VA_IRR,na.rm = TRUE))/max(df_period2$VA_IRR,na.rm = TRUE)
+        
+        Last_DA_MDD <-(max(df_period1$DA_IRR,na.rm = TRUE)-min(df_period1$DA_IRR,na.rm = TRUE))/max(df_period1$DA_IRR,na.rm = TRUE)
+        Label_DA_MDD <-(max(df_period2$DA_IRR,na.rm = TRUE)-min(df_period2$DA_IRR,na.rm = TRUE))/max(df_period2$DA_IRR,na.rm = TRUE)
+        
+        Last_GA_MDD <-(max(df_period1$GA_IRR,na.rm = TRUE)-min(df_period1$GA_IRR,na.rm = TRUE))/max(df_period1$GA_IRR,na.rm = TRUE)
+        Label_GA_MDD <-(max(df_period2$GA_IRR,na.rm = TRUE)-min(df_period2$GA_IRR,na.rm = TRUE))/max(df_period2$GA_IRR,na.rm = TRUE)
+        
+        
+        new_row = data.frame(
+          Ticker = tiker,
+          Year_Start = start,
+          Last_VA_IRR = Last_VA_IRR,
+          Label_VA_IRR = Label_VA_IRR,
+          Last_DA_IRR = Last_DA_IRR,
+          Label_DA_IRR = Label_DA_IRR,
+          Last_GA_IRR = Last_GA_IRR,
+          Label_GA_IRR = Label_GA_IRR,
+          Last_VA_Sharpe_Ratio = Last_VA_Sharpe_Ratio,
+          Label_VA_Sharpe_Ratio = Label_VA_Sharpe_Ratio,
+          Last_DA_Sharpe_Ratio = Last_DA_Sharpe_Ratio,
+          Label_DA_Sharpe_Ratio = Label_DA_Sharpe_Ratio,
+          Last_GA_Sharpe_Ratio = Last_GA_Sharpe_Ratio,
+          Label_GA_Sharpe_Ratio = Label_GA_Sharpe_Ratio,          
+          Last_VA_volatility = Last_VA_volatility,
+          Label_VA_volatility = Label_VA_volatility,
+          Last_DA_volatility = Last_DA_volatility,
+          Label_DA_volatility = Label_DA_volatility,
+          Last_GA_volatility = Last_GA_volatility,
+          Label_GA_volatility = Label_GA_volatility,
+          Last_VA_MDD = Last_VA_MDD,
+          Label_VA_MDD = Label_VA_MDD,
+          Last_DA_MDD = Last_DA_MDD,
+          Label_DA_MDD = Label_DA_MDD,
+          Last_GA_MDD = Last_GA_MDD,
+          Label_GA_MDD = Label_GA_MDD
+         )
+
+       # 결과 데이터프레임에 추가
+       result_df=rbind(result_df,new_row)
+     }
+   }
+  }
+negative_counts <- apply(result_df[,3:8], 2, function(x) sum(x < 0, na.rm = TRUE)/dim(result_df)[1]*100)
+print(negative_counts)
+return(result_df)
+}
+```
+
+```{r}
+tikers=c("SPY", "QQQ", "DIA")
+df_10=calculate_metrics_10y(tikers)
+```
+```{r}
+wilcox.test(df_10$Last_GA_IRR, df_10$Label_GA_IRR, paired = TRUE, alternative = "greater")
+wilcox.test(df_10$Last_GA_IRR, df_10$Last_DA_IRR, paired = TRUE, alternative = "greater")
+wilcox.test(df_10$Last_DA_Sharpe_Ratio, df_10$Last_GA_Sharpe_Ratio, paired = TRUE, alternative = "less")
+
+```
+## 2.12 example
+```{r}
+DA_col<-"#fe001a"
+VA_col<-"#3b5998"
+GA_col<-"#2DB400"
+```
+
+```{r}
+# 티커 리스트 생성
+tickers <- c("QQQ", "SPY", "DIA")
+
+# 각 티커에 대해 함수 적용
+for (ticker in tickers) {
+  # 가격 데이터 가져오기
+  data <- get_close_prices(ticker,"2013-08-01","2023-08-31")
+  
+  # _label 및 _last 데이터 생성
+  data_last <- get_last_day_rows(data)
+  data_label <- get_labels_rows(data)
+  
+  # 함수 적용
+  data_last <- add_VA(data_last)
+  data_last <- add_DA(data_last)
+  data_last <- add_GA(data_last)
+
+   data_label <- add_VA(data_label)
+   data_label <- add_DA(data_label)
+   data_label <- add_GA(data_label)
+
+   # 결과 저장
+   assign(paste0(ticker), data) 
+   assign(paste0(ticker, "_last"), data_last)
+   assign(paste0(ticker, "_label"), data_label)
+}
+
+```
+```{r}
+QQQ_label
+```
+
+```{r}
+ticker_method_split <- strsplit(names(data_list)[[i]], "_") # Ticker와 Method 분리
+ticker_method_split[[1]][1]
+```
+
+```{r}
+# 빈 데이터프레임 생성
+results_VA <- data.frame(Ticker = character(), 
+                      Method = character(), 
+                      IRR = numeric(), 
+                      Sharpe_Ratio = numeric(),
+                      MDD = numeric(),
+                      Volatility = numeric(),
+                      ROI = numeric(),
+                      stringsAsFactors=FALSE)
+
+# 리스트에 데이터 프레임 저장
+data_list <- list(QQQ_last, SPY_last, DIA_last, QQQ_label, SPY_label, DIA_label)
+names(data_list) <- c("QQQ_last", "SPY_last", "DIA_last", "QQQ_label", "SPY_label", "DIA_label")
+
+# 각 데이터 프레임에 대해 계산 후 결과 저장
+for(i in 1:length(data_list)) {
+  VA_IRR <- data_list[[i]][nrow(data_list[[i]]),]$VA_IRR
+  VA_sharpe_ratio <- (mean(data_list[[i]]$VA_IRR,na.rm = TRUE)-rate)/sd(data_list[[i]]$VA_IRR,na.rm = TRUE)
+  VA_mdd <- (max(data_list[[i]]$VA_IRR,na.rm = TRUE)-min(data_list[[i]]$VA_IRR,na.rm = TRUE))/max(data_list[[i]]$VA_IRR,na.rm = TRUE)
+  VA_volatility <- sd(data_list[[i]]$VA_IRR, na.rm=TRUE)*sqrt(252)
+  VA_ROI <- data_list[[i]][nrow(data_list[[i]]),]$VA_ROI # 수정된 부분
+  ticker_method_split <- strsplit(names(data_list)[[i]], "_") # Ticker와 Method 분리
+  
+  results_VA[nrow(results_VA) + 1 ,] <- list(ticker_method_split[[1]][1], ticker_method_split[[1]][2], 
+                                        VA_IRR,
+                                        VA_sharpe_ratio,
+                                        VA_mdd ,
+                                        VA_volatility,
+                                        VA_ROI) # ROI 추가
+}
+
+print(results_VA)
+
+```
+
+```{r}
+# 빈 데이터프레임 생성
+results_DA <- data.frame(Ticker = character(), 
+                      Method = character(), 
+                      IRR = numeric(), 
+                      Sharpe_Ratio = numeric(),
+                      MDD = numeric(),
+                      Volatility = numeric(),
+                      ROI = numeric(),
+                      stringsAsFactors=FALSE)
+
+# 각 데이터 프레임에 대해 계산 후 결과 저장
+for(i in 1:length(data_list)) {
+  DA_IRR <- data_list[[i]][nrow(data_list[[i]]),]$DA_IRR
+  DA_sharpe_ratio <- (mean(data_list[[i]]$DA_IRR,na.rm = TRUE)-rate)/sd(data_list[[i]]$DA_IRR,na.rm = TRUE)
+  DA_mdd <- (max(data_list[[i]]$DA_IRR,na.rm = TRUE)-min(data_list[[i]]$DA_IRR,na.rm = TRUE))/max(data_list[[i]]$DA_IRR,na.rm = TRUE)
+  DA_volatility <- sd(data_list[[i]]$DA_IRR, na.rm=TRUE)*sqrt(252)
+  DA_ROI <- data_list[[i]][nrow(data_list[[i]]),]$DA_ROI # ROI 계산 추가
+
+  ticker_method_split <- strsplit(names(data_list)[[i]], "_") # Ticker와 Method 분리
+  
+  results_DA[nrow(results_DA) + 1 ,] <- list(ticker_method_split[[1]][1], ticker_method_split[[1]][2], 
+                                        DA_IRR,
+                                        DA_sharpe_ratio,
+                                        DA_mdd ,
+                                        DA_volatility,
+                                        DA_ROI) # ROI 추가
+}
+
+print(results_DA)
+
+```
+
+```{r}
+# 빈 데이터프레임 생성
+results_GA <- data.frame(Ticker = character(), 
+                      Method = character(), 
+                      IRR = numeric(), 
+                      Sharpe_Ratio = numeric(),
+                      MDD = numeric(),
+                      Volatility = numeric(),
+                      ROI = numeric(), # ROI 추가
+                      stringsAsFactors=FALSE)
+
+# 각 데이터 프레임에 대해 계산 후 결과 저장
+for(i in 1:length(data_list)) {
+  GA_IRR <- data_list[[i]][nrow(data_list[[i]]),]$GA_IRR
+  GA_sharpe_ratio <- (mean(data_list[[i]]$GA_IRR,na.rm = TRUE)-rate)/sd(data_list[[i]]$GA_IRR,na.rm = TRUE)
+  GA_mdd <- (max(data_list[[i]]$GA_IRR,na.rm = TRUE)-min(data_list[[i]]$GA_IRR,na.rm = TRUE))/max(data_list[[i]]$GA_IRR,na.rm = TRUE)
+  GA_volatility <- sd(data_list[[i]]$GA_IRR, na.rm=TRUE)*sqrt(252)
+  GA_ROI <- data_list[[i]][nrow(data_list[[i]]),]$GA_ROI # ROI 계산 추가
+
+  ticker_method_split <- strsplit(names(data_list)[[i]], "_") # Ticker와 Method 분리
+  
+  results_GA[nrow(results_GA) + 1 ,] <- list(ticker_method_split[[1]][1], ticker_method_split[[1]][2], 
+                                        GA_IRR,
+                                        GA_sharpe_ratio,
+                                        GA_mdd ,
+                                        GA_volatility,
+                                        GA_ROI) # ROI 추가
+}
+
+print(results_GA)
+
+```
+```{r}
+# Strategy 열 추가
+results_VA$Strategy <- "VA"
+results_DA$Strategy <- "DA"
+results_GA$Strategy <- "GA"
+
+# 데이터 프레임 합치기
+final_results <- rbind(results_VA, results_DA, results_GA)
+
+print(final_results)
+```
+
+
+```{r}
+# Method, Last, Strategy에 따른 평균 계산
+avg_results <- final_results %>%
+  group_by(Method, Strategy) %>%
+  summarise_all(mean, na.rm = TRUE)
+
+print(avg_results)
+
+```
+```{r}
+# 각 전략에 대한 HEX 코드 설정
+DA_col <- "#fe001a"
+VA_col <- "#3b5998"
+GA_col <- "#2DB400"
+
+# Method가 'last'인 행만 선택하고 데이터 재구조화
+avg_results_last <- avg_results %>% 
+  filter(Method == "last") %>%
+  gather(key="Variable", value="Value", -Method, -Strategy, -Ticker) # Variable 열은 측정항목 이름, Value 열은 해당 값
+
+# unique 변수 목록 생성
+variables <- unique(avg_results_last$Variable)
+
+color_map <- c("DA"=DA_col, "VA"=VA_col, "GA"=GA_col) # 각 전략에 대한 색상 매핑
+
+# 각 변수마다 바 차트 생성
+for (v in variables) {
+  data <- avg_results_last[avg_results_last$Variable == v,]
+  
+  p <- ggplot(data, aes(x=Strategy, y=Value)) +
+    geom_bar(stat="identity", position="dodge", aes(fill=Strategy)) +
+    scale_fill_manual(values=color_map) + # scale_fill_manual로 컬러맵을 직접 지정합니다.
+    geom_text(aes(label=round(Value, 2)), vjust=-0.3,
+              position = position_dodge(width=.9)) + # 막대 위에 수치 추가 (소수점 둘째 자리까지 반올림)
+    theme_minimal() +
+    labs(title=paste("Average Values of", v,"by Strategy"),
+         x="Strategy",
+         y="Average Value")
+  
+  print(p)
+}
+
+
+```
+
+```{r}
+# 빈 데이터프레임 생성
+results_VA_PR <- data.frame(Ticker = character(), 
+                      Method = character(), 
+                      VA_Period_Invest = numeric(),
+                      stringsAsFactors=FALSE)
+
+# 리스트에 데이터 프레임 저장
+data_list <- list(QQQ_last, SPY_last, DIA_last, QQQ_label, SPY_label, DIA_label)
+names(data_list) <- c("QQQ_last", "SPY_last", "DIA_last", "QQQ_label", "SPY_label", "DIA_label")
+
+# 각 데이터 프레임에 대해 계산 후 결과 저장
+for(i in 1:length(data_list)) {
+  VA_Period_Invest <- data_list[[i]][nrow(data_list[[i]]),]$VA_Period_Invest
+  ticker_method_split <- strsplit(names(data_list)[[i]], "_") # Ticker와 Method 분리
+  results_VA_PR[nrow(results_VA_PR) + 1 ,] <- list(ticker_method_split[[1]][1], ticker_method_split[[1]][2], 
+                                        VA_Period_Invest) 
+}
+
+print(results_VA_PR)
+```
+```{r}
+df_last<-data.frame()
+df_last<-rbind(QQQ_last[nrow(QQQ_last),])
+df_last<-rbind(df_last,SPY_last[nrow(SPY_last),])
+df_last<-rbind(df_last,DIA_last[nrow(DIA_last),])
+df_last$Ticker <- c("QQQ","SPY","DIA")
+```
+```{r}
+df_last
+```
+
+
+```{r}
+# 데이터프레임 병합
+df <- rbind(
+  data.frame(Date = SPY$Date, Close = SPY$Close, Ticker = 'SPY'),
+  data.frame(Date = DIA$Date, Close = DIA$Close, Ticker = 'DIA'),
+  data.frame(Date = QQQ$Date, Close = QQQ$Close, Ticker = 'QQQ')
+)
+
+# 그래프 생성
+ggplot(df, aes(x=Date)) +
+  geom_line(aes(y=Close, color=Ticker)) +
+  labs(x='Date', y='Closing Price', color='Ticker') +
+  theme_minimal()
+
+```
+
+```{r}
+# Strategy 별로 Value의 평균 계산 (IRR)
+df_long_IRR <- df_long_IRR %>%
+  group_by(Strategy) %>%
+  summarise(Value = mean(Value, na.rm = TRUE))
+
+# IRR 바 차트 생성
+ggplot(df_long_IRR, aes(x=Strategy, y=Value)) +
+  geom_bar(stat="identity", position="dodge", aes(fill=Strategy)) +
+  scale_fill_manual(values=color_map) + # scale_fill_manual로 컬러맵을 직접 지정합니다.
+  labs(title="Average IRR by Strategy",
+       x="Strategy",
+       y="Average IRR Value")
+
+# Strategy 별로 Value의 평균 계산 (ROI)
+df_long_ROI <- df_long_ROI %>%
+  group_by(Strategy) %>%
+  summarise(Value = mean(Value, na.rm = TRUE))
+
+# ROI 바 차트 생성
+ggplot(df_long_ROI, aes(x=Strategy,y=Value)) +
+  geom_bar(stat="identity", position="dodge", aes(fill=Strategy)) +
+  scale_fill_manual(values=color_map) + # scale_fill_manual로 컬러맵을 직접 지정합니다.
+  labs(title="Average ROI by Strategy",
+       x="Strategy",
+       y=="Average ROI Value")
+
+
+```
+```{r}
+# 데이터 리스트 생성
+data_list <- list(QQQ_last, SPY_last, DIA_last)
+
+# 결과를 저장할 데이터 프레임 생성
+results_VA_PR <- data.frame(Method = character(),
+                            Count_Above_500 = numeric(),
+                            Count_Above_400 = numeric(),
+                            Count_Above_300 = numeric(),
+                            Count_Above_200 = numeric(),
+                            stringsAsFactors=FALSE)
+
+# 각 데이터 프레임에 대해 계산 후 결과 저장
+for (method in c("VA_Period_Invest", "GA_Period_Invest")) {
+     Count_Above_500 <- sum(unlist(lapply(data_list, function(x) sum(x[[method]] > 500))))
+    Count_Above_400 <- sum(unlist(lapply(data_list, function(x) sum(x[[method]] > 400))))
+    Count_Above_300 <- sum(unlist(lapply(data_list, function(x) sum(x[[method]] > 300))))
+    Count_Above_200 <- sum(unlist(lapply(data_list, function(x) sum(x[[method]] > 200))))
+
+    results_VA_PR[nrow(results_VA_PR) + 1 ,] <- list(method,
+                                                     Count_Above_500,
+                                                     Count_Above_400,
+                                                     Count_Above_300,
+                                                     Count_Above_200) 
+}
+
+# 데이터 재구조화 (long format)
+results_long_format <- gather(results_VA_PR, key="Threshold", value="Count", -Method)
+
+# 바 차트 생성
+ggplot(results_long_format, aes(x=Method, y=Count)) +
+    geom_bar(stat="identity", position="dodge", aes(fill=Method)) +
+    geom_text(aes(label=Count), vjust=-0.3) + # 막대 위에 y 값 표시 
+    scale_fill_manual(values=c("VA_Period_Invest"=VA_col, "GA_Period_Invest"=GA_col)) +
+    facet_wrap(~Threshold) + # Threshold 별로 서브플롯 생성
+    labs(title="Number of VA and GA Period Invest above certain thresholds",
+         x="Method",
+         y="Count") +
+     theme(axis.text.x = element_text(size=6)) # x 축 레이블 크기 조정
+
+```
+```{r}
+# GA_label_IRR와 GA_last_IRR의 평균 계산
+GA_label_IRR <- mean(c(QQQ_label[nrow(QQQ_label),]$GA_IRR, SPY_label[nrow(SPY_label),]$GA_IRR, DIA_label[nrow(DIA_label),]$GA_IRR))
+GA_last_IRR <- mean(c(QQQ_last[nrow(QQQ_last),]$GA_IRR, SPY_last[nrow(SPY_last),]$GA_IRR, DIA_last[nrow(DIA_last),]$GA_IRR))
+
+# 데이터 프레임 생성
+df <- data.frame(
+  Value = c(GA_label_IRR, GA_last_IRR),
+  Ticker = c("Bollinger", "Last")
+)
+
+# 색상 매핑 설정
+color_map <- c("Bollinger"="#e78111", "Last"="#a3a6cd")
+
+# 바 차트 생성
+ggplot(df, aes(x=Ticker, y=Value)) +
+  geom_bar(stat="identity", aes(fill=Ticker), position="dodge") +
+  scale_fill_manual(values=color_map) + # scale_fill_manual로 컬러맵을 직접 지정합니다.
+  labs(title="Comparison of GA_label_IRR and GA_last_IRR",
+       x="Ticker",
+       y="Value") +
+  geom_text(aes(label=round(Value,4)), vjust=-0.3)
+
+```
+```{r}
+# GA_label_ROI와 GA_last_ROI의 평균 계산
+GA_label_ROI <- median(c(QQQ_label[nrow(QQQ_label),]$GA_Value, SPY_label[nrow(SPY_label),]$GA_Value, DIA_label[nrow(DIA_label),]$GA_Value))
+GA_last_ROI <- median(c(QQQ_last[nrow(QQQ_last),]$GA_Value, SPY_last[nrow(SPY_last),]$GA_Value, DIA_last[nrow(DIA_last),]$GA_Value))
+
+# 데이터 프레임 생성
+df_roi <- data.frame(
+  Value = c(GA_label_ROI, GA_last_ROI),
+  Ticker = c("Bollinger", "Last")
+)
+
+# 색상 매핑 설정
+color_map <- c("Bollinger"="#e78111", "Last"="#a3a6cd")
+
+# 바 차트 생성
+ggplot(df_roi, aes(x=Ticker, y=Value)) +
+  geom_bar(stat="identity", aes(fill=Ticker), position="dodge") +
+  scale_fill_manual(values=color_map) + # scale_fill_manual로 컬러맵을 직접 지정합니다.
+  labs(title="Comparison of GA_label_Value and GA_last_Value",
+       x="Ticker",
+       y="Value") +
+  geom_text(aes(label=round(Value,4)), vjust=-0.3)
+```
+```{r}
+df_label <- rbind(QQQ_label, SPY_label, DIA_label)
+df_label <- subset(df_label, select = -c(YearMonth))
+df_label_count <- df_label %>% count(Label)
+
+ggplot(df_label_count, aes(x="", y=n, fill=Label)) +
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar("y", start=0) + 
+  geom_text(aes(label = n), position = position_stack(vjust = 0.5)) +
+  labs(x = NULL, y = NULL, fill = "Label", 
+       title="Number of Labels")
+```
+```{r}
+GA_label_IRR <-c(QQQ_label[nrow(QQQ_label),]$GA_IRR, SPY_label[nrow(SPY_label),]$GA_IRR, DIA_label[nrow(DIA_label),]$GA_IRR)
+GA_last_IRR <- c(QQQ_last[nrow(QQQ_last),]$GA_IRR, SPY_last[nrow(SPY_last),]$GA_IRR, DIA_last[nrow(DIA_last),]$GA_IRR)
+
+wilcox.test(GA_label_IRR, GA_last_IRR, paired = TRUE, alternative = "greater")
+```
+
+
+# 3. simulation
+## 3.1 increasing
+```{r}
+df <- data.frame(
+  Date = 1:2642,
+  Close = seq(from =67.20, to = 369.42, length.out = 2642)
+)
+
+```
+```{r}
+plot(df$Date, df$Close, type = "l", main = "Close over Time", xlab = "Date", ylab = "Close")
+```
+
+```{r}
+df_DA<-add_DA(df)
+increse_DVMA<-add_VA(df_DA)
+```
+```{r}
+# 'Shares_Owned'가 이름에 포함된 열만 선택합니다.
+selected_columns <- tail(increse_DVMA)[, grepl("ROI", names(tail(increse_DVMA)))]
+selected_columns
+```
+
+```{r}
+# 'Shares_Owned'가 이름에 포함된 열만 선택합니다.
+selected_columns <- tail(increse_DVMA)[, grepl("IRR", names(tail(increse_DVMA)))]
+selected_columns
+```
+
+```{r}
+ggplot(increse_DVMA) +
+  geom_line(aes(x = Date, y = DA_Average_cost, color = "DA_Average_cost")) +
+  geom_line(aes(x = Date, y = VA_Average_cost, color = "VA_Average_cost")) +
+  labs(title = "Time Series Plot of Average Costs", x = "Date", y ="Average Cost") +
+  scale_color_manual(values=c("DA_Average_cost"="blue",
+                              "VA_Average_cost"="red")) +
+  theme_minimal()
+```
+```{r}
+ggplot(increse_DVMA) +
+  geom_line(aes(x = Date, y = DA_ROI, color = "DA_IRR")) +
+  geom_line(aes(x = Date, y = VA_ROI, color = "VA_IRR")) +
+  labs(title = "Time Series Plot of IRR", x = "Date", y ="IRR") +
+  scale_color_manual(values=c("DA_IRR"="blue",
+                              "VA_IRR"="red"
+                              )) +
+  theme_minimal()
+```
+## 3.2 decreasing
+```{r}
+n <- 2642
+
+# x 값을 생성합니다 (여기서는 Date)
+x <- seq(from = 369.42, to =67.2 , length.out = n)
+
+
+df <- data.frame(
+    Date = seq(1:n),
+    Close = x
+)
+```
+
+```{r}
+plot(df$Date, df$Close, type = "l", main = "Close over Time", xlab = "Date", ylab = "Close")
+```
+
+```{r}
+df_DA<-add_DA(df)
+increse_DVMA<-add_VA(df_DA)
+```
+
+```{r}
+# 'Shares_Owned'가 이름에 포함된 열만 선택합니다.
+selected_columns <- tail(increse_DVMA)[, grepl("ROI", names(tail(increse_DVMA)))]
+selected_columns
+```
+
+```{r}
+# 'Shares_Owned'가 이름에 포함된 열만 선택합니다.
+selected_columns <- tail(increse_DVMA)[, grepl("IRR", names(tail(increse_DVMA)))]
+selected_columns
+```
+
+```{r}
+ggplot(increse_DVMA) +
+  geom_line(aes(x = Date, y = DA_Average_cost, color = "DA_Average_cost")) +
+  geom_line(aes(x = Date, y = VA_Average_cost, color = "VA_Average_cost")) +
+  labs(title = "Time Series Plot of Average Costs", x = "Date", y ="Average Cost") +
+  scale_color_manual(values=c("DA_Average_cost"="blue",
+                              "VA_Average_cost"="red")) +
+  theme_minimal()
+```
+```{r}
+ggplot(increse_DVMA) +
+  geom_line(aes(x = Date, y = DA_ROI, color = "DA_IRR")) +
+  geom_line(aes(x = Date, y = VA_ROI, color = "VA_IRR")) +
+  labs(title = "Time Series Plot of IRR", x = "Date", y ="IRR") +
+  scale_color_manual(values=c("DA_IRR"="blue",
+                              "VA_IRR"="red"
+                              )) +
+  theme_minimal()
+```
+## 3.3 fluctuating
+```{r}
+set.seed(133)
+
+n <- 2642
+
+# 초기 주가 설정
+init_price <- 67.2
+
+# 자기회귀 계수 설정 (이전 시점의 주가에 대한 가중치)
+ar_coef <- 1
+
+# 백색잡음의 표준편차 설정
+sd_noise <- 0.01
+
+# 빈 벡터로 초기화된 주가 시계열 생성
+price <- rep(0, n)
+
+# 첫 번째 값을 초기 주가로 설정
+price[1] <- init_price
+
+for (t in 2:n) {
+    # 이전 시점의 주가와 백색잡음을 고려하여 현재 시점의 주가 계산
+    price[t] <- ar_coef * price[t-1] * rlnorm(1, meanlog=0, sdlog=sd_noise)
+}
+
+
+df <- data.frame(
+    Date = seq(1:n),
+    Close = price
+)
+
+```
+
+```{r}
+plot(df$Date, df$Close, type = "l", main = "Close over Time", xlab = "Date", ylab = "Close")
+```
+
+```{r}
+df_DA<-add_DA(df)
+increse_DVMA<-add_VA(df_DA)
+```
+
+```{r}
+# 'Shares_Owned'가 이름에 포함된 열만 선택합니다.
+selected_columns <- tail(increse_DVMA)[, grepl("ROI", names(tail(increse_DVMA)))]
+selected_columns
+```
+
+```{r}
+# 'Shares_Owned'가 이름에 포함된 열만 선택합니다.
+selected_columns <- tail(increse_DVMA)[, grepl("IRR", names(tail(increse_DVMA)))]
+selected_columns
+```
+
+```{r}
+ggplot(increse_DVMA) +
+  geom_line(aes(x = Date, y = DA_Average_cost, color = "DA_Average_cost")) +
+  geom_line(aes(x = Date, y = VA_Average_cost, color = "VA_Average_cost")) +
+  labs(title = "Time Series Plot of Average Costs", x = "Date", y ="Average Cost") +
+  scale_color_manual(values=c("DA_Average_cost"="blue",
+                              "VA_Average_cost"="red")) +
+  theme_minimal()
+```
+```{r}
+ggplot(increse_DVMA) +
+  geom_line(aes(x = Date, y = DA_ROI, color = "DA_IRR")) +
+  geom_line(aes(x = Date, y = VA_ROI, color = "VA_IRR")) +
+  labs(title = "Time Series Plot of IRR", x = "Date", y ="IRR") +
+  scale_color_manual(values=c("DA_IRR"="blue",
+                              "VA_IRR"="red"
+                              )) +
+  theme_minimal()
+```
+
+## 3.4 Bollinger Band Example
+```{r}
+# 라이브러리 로드
+library(quantmod)
+library(TTRㅎ)
+library(ggplot2)
+library(dplyr)
+
+# 주식 데이터 가져오기 (여기서는 Apple의 최근 1년 주식 데이터)
+getSymbols("AAPL", src = "yahoo", from = Sys.Date() - 365)
+
+# 볼린저 밴드 계산 (여기서는 20일 이동 평균을 사용)
+bbands <- BBands(Cl(AAPL), n=20)
+
+# 볼린저 밴드와 원래 데이터 합치기
+df <- data.frame(Date=index(AAPL), coredata(AAPL), coredata(bbands))
+
+# 첫 20일 제거
+df <- df[-(1:20), ]
+
+# Overbought, Oversold 지점 찾기
+overbought_index <- which.max(df$AAPL.Close - df$up) 
+oversold_index <- which.max(df$dn - df$AAPL.Close) 
+
+# ggplot으로 그리기
+ggplot(df, aes(x=Date)) +
+  geom_line(aes(y=AAPL.Close), color="black", size=1.5) + # 주가 선 색상을 검정색으로 변경 
+  geom_line(aes(y=dn), color="red", size=1.5) +
+  geom_line(aes(y=mavg), color="grey", size=1.5) + # 중앙선 색상을 회색으로 변경 
+  geom_line(aes(y=up), color="#006400", size=1.5) + 
+  labs(x="Date", y="Price", title="Bollinger Bands") + 
+  annotate("text", x = middle_date, y = df$dn[floor(nrow(df)/2)], label = "Lower Band",
+           hjust=-0.7, fontface='bold', size=4, colour='red') + 
+  annotate("text", x = middle_date, y = df$mavg[floor(nrow(df)/2)], label = "Middle Band",
+           hjust=-0.01, fontface='bold', size=4, colour='grey') + # 중앙선 라벨 색상도 회색으로 변경  
+   annotate("text", x = middle_date, y = df$up[floor(nrow(df)/2)], label ="Upper Band",
+           hjust=1.4, fontface='bold', size=4 , colour='#006400') +
+  annotate("text", x = df$Date[overbought_index], y = df$up[overbought_index] + 5, label ="Overbought",
+           hjust=0.7, fontface='bold', size=2 , colour='#006400') + 
+  annotate("text", x = df$Date[oversold_index], y = df$dn[oversold_index] - 5, label ="Oversold",
+           hjust=0.9, fontface='bold', size=2 , colour='red')
+
+
+
+```
+
+
+# 4. plue
+
+## 4.1 CGM
+```{r}
+# CGMFX 데이터 가져오기
+CGMFX<-get_close_prices("CGMFX", "2019-01-02	","2022-12-05")
+
+# NA 값 제거하기
+# dplyr 패키지 로드
+library(dplyr)
+
+# SPY 데이터 프레임에서 특정 날짜 범위의 데이터만 추출
+SPY_day <- filter(SPY, Date >= "2019-01-02" & Date <= "2022-12-02")
+```
+```{r}
+# 각각의 성장률 계산 (첫 날 대비 변화율)
+SPY_day$Growth <- SPY_day$Close / SPY_day$Close[1]
+CGMFX$Growth <- CGMFX$Close / CGMFX$Close[1]
+
+# 두 데이터 합치기
+data_combined <- rbind(
+  mutate(SPY_day, ETF="SPY"),
+  mutate(CGMFX, ETF="CGMFX")
+)
+
+# 성장률 비교 그래프 생성
+ggplot(data_combined, aes(x=Date, y=Growth, color=ETF)) +
+  geom_line() +
+  labs(title="Growth comparison: SPY vs CGMFX",
+       x="Date",
+       y="Growth rate",
+       color="ETF")
+```
+```{r}
+
+# 성장률 차이 계산
+growth_diff <- CGMFX$Growth-SPY_day$Growth 
+
+# 데이터 프레임 생성 (날짜와 성장률 차이)
+data_diff <- data.frame(Date=SPY_day$Date, GrowthDiff=growth_diff)
+
+# 그래프 생성
+ggplot(data_diff, aes(x=Date, y=GrowthDiff)) +
+  geom_line() +
+  labs(title="Growth difference: SPY vs CGMFX",
+       x="Date",
+       y="Growth rate difference")
++theme_bw()
+```
+
+```{r}
+# FMAGX 데이터 가져오기
+FMAGX <- get_close_prices("FMAGX", "1993-02-01", "2022-12-05")
+SPY_day <- get_close_prices("SPY", "1993-02-01", "2022-12-05")
+
+# 각각의 성장률 계산 (첫 날 대비 변화율)
+SPY_day$Growth <- SPY_day$Close / SPY_day$Close[1]
+FMAGX$Growth <- FMAGX$Close / FMAGX$Close[1]
+
+# 성장률 차이 계산
+growth_diff <- FMAGX$Growth - SPY_day$Growth 
+
+# 데이터 프레임 생성 (날짜와 성장률 차이)
+data_diff <- data.frame(Date=SPY_day$Date, GrowthDiff=growth_diff)
+
+# 그래프 생성
+ggplot(data_diff, aes(x=Date, y=GrowthDiff)) +
+  geom_line() +
+  labs(title="Growth difference: SPY vs FMAGX",
+       x="Date",
+       y="Growth rate difference") +
+  theme_bw()
+
+```
+
