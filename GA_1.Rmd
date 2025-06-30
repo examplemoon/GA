@@ -508,6 +508,8 @@ df <- data.frame(Date=index(AAPL), coredata(AAPL), coredata(bbands))
 # 첫 20일 제거
 df <- df[-(1:20), ]
 
+middle_date <- df$Date[floor(nrow(df) / 2)]
+
 # Overbought, Oversold 지점 찾기
 overbought_index <- which.max(df$AAPL.Close - df$up) 
 oversold_index <- which.max(df$dn - df$AAPL.Close) 
